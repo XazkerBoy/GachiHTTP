@@ -1,5 +1,5 @@
 import asyncio
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from ssl import create_default_context, SSLContext
 from json import loads as json_loads
 from aiohttp_socks import ProxyConnector
@@ -168,58 +168,44 @@ def request(method: str, url: str, params: Union[dict, tuple] = None, data: Unio
     return Request(method.upper(), url, params, data, json, headers, skip_headers)
 
 
-def get(url: str, params: Union[dict, tuple] = None, headers: Optional[dict] = None) -> Request:
+def get(url: str, **kwargs) -> Request:
     """
     HTTP GET Method. Generates and returns a Request object
 
     :param url: URL to request
-    :param params: Query params to add to url
-    :param headers: Headers as dict
     :return: Request object
     """
-    return request('GET', url=url, params=params, headers=headers)
+    return request('GET', url=url, **kwargs)
 
 
-def delete(url: str, params: Union[dict, tuple] = None, headers: Optional[dict] = None) -> Request:
+def delete(url: str, **kwargs) -> Request:
     """
     HTTP DELETE Method. Generates and returns a Request object
 
     :param url: URL to request
-    :param params: Query params to add to url
-    :param headers: Headers as dict
     :return: Request object
     """
-    return request('DELETE', url=url, params=params, headers=headers)
+    return request('DELETE', url=url, **kwargs)
 
 
-def post(url: str, params: Union[dict, tuple] = None, data: Union[dict, str] = None, json: Optional[dict] = None,
-         headers: Optional[dict] = None) -> Request:
+def post(url: str, **kwargs) -> Request:
     """
     HTTP POST Method. Generates and returns a Request object
 
     :param url: URL to request
-    :param params: Query params to add to url
-    :param headers: Headers as dict
-    :param data: POST data as dict (Content-Type: urlencoded) or string (Content-Type: text/plain)
-    :param json: JSON POST data (Content-Type: application/json)
     :return: Request object
     """
-    return request('POST', url=url, params=params, data=data, json=json, headers=headers)
+    return request('POST', url=url, **kwargs)
 
 
-def put(url: str, params: Union[dict, tuple] = None, data: Union[dict, str] = None, json: Optional[dict] = None,
-        headers: Optional[dict] = None) -> Request:
+def put(url: str, **kwargs) -> Request:
     """
     HTTP PUT Method. Generates and returns a Request object
 
     :param url: URL to request
-    :param params: Query params to add to url
-    :param headers: Headers as dict
-    :param data: PUT data as dict (Content-Type: urlencoded) or string (Content-Type: text/plain)
-    :param json: JSON PUT data (Content-Type: application/json)
     :return: Request object
     """
-    return request('PUT', url=url, params=params, data=data, json=json, headers=headers)
+    return request('PUT', url=url, **kwargs)
 
 
 async def __exec_req(sem: asyncio.Semaphore, sess: ClientSession, req: Request, ssl: SSLContext, include_content: bool,
@@ -260,7 +246,7 @@ async def __exec_req(sem: asyncio.Semaphore, sess: ClientSession, req: Request, 
 
 
 async def __make_reqs(reqs: List[Request], size: int, timeout: Optional[int], include_content: bool, exception_handler,
-                      success_handler, verify_ssl: bool, proxies: str) -> List[Response]:
+                      success_handler, verify_ssl: bool, proxies: Union[dict, str, None]) -> List[Response]:
     """
     Asynchronous runner for map() function. Do not start it yourself, use map() instead
 
@@ -275,9 +261,6 @@ async def __make_reqs(reqs: List[Request], size: int, timeout: Optional[int], in
     :param proxies: String with proxy [http, socks4, socks5]
     :return: List with Response objects
     """
-    proxy_connector = None
-    if isinstance(proxies, str):
-        proxy_connector = ProxyConnector.from_url(proxies)
 
     sem = asyncio.Semaphore(size)  # Usage in __execReq()
 
@@ -285,8 +268,20 @@ async def __make_reqs(reqs: List[Request], size: int, timeout: Optional[int], in
     if verify_ssl:
         ssl = create_default_context()  # Create SSL Context
 
-    async with ClientSession(connector=proxy_connector, timeout=ClientTimeout(total=timeout)) as sess:  # Create session
-        fut = asyncio.gather(
+    if proxies is not None:
+        if isinstance(proxies, dict):  # Dict format (requests-like): {'https': 'https/socks4(5)://...'}
+            proxies = list(proxies.values())[0]  # Get only the value string ("https/socks4(5)://...")
+        if isinstance(proxies, str):  # Check got string
+            if not __startswith(proxies, ['http', 'socks']):  # Doesnt start with supported type
+                proxies = None
+            else:
+                proxies = ProxyConnector.from_url(proxies)  # Create new proxy connector
+        elif not isinstance(proxies, TCPConnector):  # Not string and not TCPConnector (ProxyConnector return)
+            # - set proxy to None
+            proxies = None
+
+    async with ClientSession(connector=proxies, timeout=ClientTimeout(total=timeout)) as sess:  # Create session
+        fut = asyncio.gather(  # Get responses
             *[asyncio.ensure_future(
                 __exec_req(sem, sess, req, ssl, include_content, exception_handler, success_handler, verify_ssl)
             ) for req in reqs]
@@ -297,10 +292,11 @@ async def __make_reqs(reqs: List[Request], size: int, timeout: Optional[int], in
 
 def map(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = None,
         include_content: Optional[bool] = True, exception_handler=None, success_handler=None,
-        verify_ssl: Optional[bool] = True, proxies: str = None) -> List[Response]:
+        verify_ssl: Optional[bool] = True, general_proxies: Union[str, dict] = None) -> List[Response]:
     """
     Map (start) asynchronous requests and get a list of responses
 
+    :param general_proxies: Proxies to use on all requests (TODO: Use only on ones that have own proxies not set)
     :param reqs: List with Request objects. Use different methods to create them
     :param size: Connections per once. Might affect some website-security (nginx) against you
     :param timeout: Connection timeout
@@ -309,7 +305,6 @@ def map(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = 
     :param success_handler: Function to report a succeeded (with no exceptions) response (passes Response object as
       parameter)
     :param verify_ssl: Must SSLContext be generated to verify an SSL connection or not
-    :param proxies: String with proxy [http, socks4, socks5]
     :return: List with Response objects
     """
     valid_reqs = []
@@ -320,13 +315,12 @@ def map(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = 
 
     # As this function might be used in separate Thread, we have to create a new loop for each one
     loop = asyncio.new_event_loop()
-
     asyncio.set_event_loop(loop)  # Set new loop for current thread
-
     fut = asyncio.gather(
         asyncio.ensure_future(
             __make_reqs(
-                valid_reqs, size, timeout, include_content, exception_handler, success_handler, verify_ssl, proxies
+                valid_reqs, size, timeout, include_content, exception_handler, success_handler, verify_ssl,
+                general_proxies
             )
         )
     )  # Start
@@ -339,10 +333,11 @@ def map(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = 
 
 
 def __threaded(executor: ThreadExecutor, reqs, size, timeout, include_content, exception_handler,
-               success_handler, verify_ssl, finished_handler) -> None:
+               success_handler, verify_ssl, finished_handler, general_proxies) -> None:
     """
     Thread runner for mapThreaded(). Do not use yourself, use mapThreaded() instead
 
+    :param general_proxies: Proxies to use on all requests
     :param executor: ThreadExecutor to report status and set data in
     :param reqs: List with Request objects. Use different methods to create them
     :param size: Connections per once. Might affect some website-security (nginx) against you
@@ -357,7 +352,7 @@ def __threaded(executor: ThreadExecutor, reqs, size, timeout, include_content, e
     executor.start()  # Let the executor know who he deals with
 
     # Map requests in separate thread
-    resp = map(reqs, size, timeout, include_content, exception_handler, success_handler, verify_ssl)
+    resp = map(reqs, size, timeout, include_content, exception_handler, success_handler, verify_ssl, general_proxies)
 
     if finished_handler is not None:
         Thread(target=finished_handler, args=[resp]).start()
@@ -366,10 +361,12 @@ def __threaded(executor: ThreadExecutor, reqs, size, timeout, include_content, e
 
 def map_threaded(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = None,
                  include_content: Optional[bool] = True, exception_handler=None, success_handler=None,
-                 verify_ssl: Optional[bool] = True, finished_handler=None) -> ThreadExecutor:
+                 verify_ssl: Optional[bool] = True, finished_handler=None,
+                 general_proxies: Union[str, dict] = None) -> ThreadExecutor:
     """
     Threaded execution of asynchronous requests. Returns a ThreadExecutor
 
+    :param general_proxies: Proxies to use on all requests
     :param reqs: List with Request objects. Use different methods to create them
     :param size: Connections per once. Might affect some website-security (nginx) against you
     :param timeout: Connection timeout
@@ -386,7 +383,7 @@ def map_threaded(reqs: List[Request], size: Optional[int] = 10, timeout: Optiona
     Thread(
         target=__threaded,
         args=[executor, reqs, size, timeout, include_content,
-              exception_handler, success_handler, verify_ssl, finished_handler]
+              exception_handler, success_handler, verify_ssl, finished_handler, general_proxies]
     ).start()
 
     return executor
