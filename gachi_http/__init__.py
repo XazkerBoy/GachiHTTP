@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from ssl import create_default_context, SSLContext
