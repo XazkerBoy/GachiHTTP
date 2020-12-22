@@ -102,10 +102,14 @@ class ThreadExecutor:
 
 class Request:
     def __init__(self, method: str, url: str, params: Union[dict, tuple], data: Union[dict, tuple, str],
-                 json: Optional[dict], headers: Optional[dict], skip_headers: Optional[list]):
+                 json: Optional[dict], headers: Optional[dict], timeout: Union[ClientTimeout, int],
+                 proxies: Union[TCPConnector, dict, str], skip_headers: Optional[list]):
         """
         Request class(es) getting passed to map() function
 
+        :param proxies: TCPConnector from ProxyConnector
+        (TODO: Support for all proxy types, currently supported: HTTP, SOCKS4/5)
+        :param timeout: ClientTimeout generated from timeout integer
         :param method: Request method
         :param url: URL to request
         :param params: Query params to add to url
@@ -114,6 +118,8 @@ class Request:
         :param json: JSON POST data (Content-Type: application/json)
         :param skip_headers: Set automatically. Which headers not to generate automatically
         """
+        self.proxies = proxies
+        self.timeout = timeout
         self.method = method
         self.url = url
         self.params = params
@@ -145,12 +151,35 @@ def __startswith(word: str, _list: list) -> bool:
     return False
 
 
+def __create_connector(proxies: Union[str, dict, TCPConnector]) -> TCPConnector:
+    """
+    Create TCPConnector with proxy
+
+    :param proxies: Proxies as str/dict (requests-like) to create TCPConnector for aiohttp Session
+    :return: TCPConnector with proxy
+    """
+    if proxies is not None:
+        if isinstance(proxies, dict):  # Dict format (requests-like): {'https': 'https/socks4(5)://...'}
+            proxies = list(proxies.values())[0]  # Get only the value string ("https/socks4(5)://...")
+        if isinstance(proxies, str):  # Check got string
+            if not __startswith(proxies, ['http', 'socks']):  # Doesnt start with supported type
+                proxies = None
+            else:
+                proxies = ProxyConnector.from_url(proxies)  # Create new proxy connector
+        elif not isinstance(proxies, TCPConnector):  # Not string and not TCPConnector (ProxyConnector return)
+            # - set proxy to None
+            proxies = None
+    return proxies
+
+
 def request(method: str, url: str, params: Union[dict, tuple] = None, data: Union[dict, str] = None,
-            json: Optional[dict] = None, headers: Optional[dict] = None,
-            skip_headers: Optional[list] = None) -> Optional[Request]:
+            json: Optional[dict] = None, headers: Optional[dict] = None, timeout: Optional[int] = None,
+            proxies: Union[dict, str] = None, skip_headers: Optional[list] = None) -> Optional[Request]:
     """
     Create a Request with specified method and parameters. Used by many methods in this lib
 
+    :param proxies: Str or dict (requests-like) proxy to execute the request
+    :param timeout: Connection/read/write timeout
     :param method: Request method
     :param url: URL to request
     :param params: Query params to add to url
@@ -166,7 +195,8 @@ def request(method: str, url: str, params: Union[dict, tuple] = None, data: Unio
         skip_headers.append('Content-Type')  # Otherwise "octet-stream" content type would be set
     if method.upper() not in ['POST', 'GET', 'PUT', 'DELETE']:
         return None
-    return Request(method.upper(), url, params, data, json, headers, skip_headers)
+
+    return Request(method.upper(), url, params, data, json, headers, timeout, proxies, skip_headers)
 
 
 def get(url: str, **kwargs) -> Request:
@@ -209,7 +239,7 @@ def put(url: str, **kwargs) -> Request:
     return request('PUT', url=url, **kwargs)
 
 
-async def __exec_req(sem: asyncio.Semaphore, sess: ClientSession, req: Request, ssl: SSLContext, include_content: bool,
+async def __exec_req(sem: asyncio.Semaphore, req: Request, ssl: SSLContext, include_content: bool,
                      exception_handler, success_handler, verify_ssl: bool) -> Response:
     """
     Executes one request asynchronously. When used in asyncio.gather() makes requests go really fast.
@@ -217,7 +247,6 @@ async def __exec_req(sem: asyncio.Semaphore, sess: ClientSession, req: Request, 
 
     :param sem: asyncio.Semaphore to avoid "Too many open files" Exception and allow the user to set number of
      concurrent connections
-    :param sess: aiohttp.ClientSession() to make requests with
     :param req: Request object
     :param ssl: Generated SSL context
     :param include_content: Whether include response content (+decoded Text) or not
@@ -229,25 +258,27 @@ async def __exec_req(sem: asyncio.Semaphore, sess: ClientSession, req: Request, 
     :return: Response object
     """
     try:
-        async with sem, sess.request(method=req.method, url=req.url, params=req.params,
-                                     data=req.data, json=req.json, headers=req.headers, ssl=ssl,
-                                     skip_auto_headers=req.skip_headers, verify_ssl=verify_ssl) as resp:
-            # Semaphore used to control amount of connections per once. Make request and perform actions
-            content = None
-            if include_content:
-                content = await resp.read()  # Read thr content
-            final = Response(req.url, resp.status, resp.headers, content)  # Generate the response
-            if success_handler is not None:  # Success handler report
-                Thread(target=success_handler, args=[final]).start()  # Because we don't know what success handler
-                # will do, it might block the further execution -> use external Thread to start it
-            return final
+        async with sem, ClientSession(timeout=req.timeout if req.timeout else ClientTimeout(),
+                                      connector=req.proxies) as sess:
+            async with sess.request(method=req.method, url=req.url, params=req.params,
+                                    data=req.data, json=req.json, headers=req.headers, ssl=ssl,
+                                    skip_auto_headers=req.skip_headers, verify_ssl=verify_ssl) as resp:
+                # Semaphore used to control amount of connections per once. Make request and perform actions
+                content = None
+                if include_content:
+                    content = await resp.read()  # Read thr content
+                final = Response(req.url, resp.status, resp.headers, content)  # Generate the response
+                if success_handler is not None:  # Success handler report
+                    Thread(target=success_handler, args=[final]).start()  # Because we don't know what success handler
+                    # will do, it might block the further execution -> use external Thread to start it
+                return final
     except Exception as e:
         if exception_handler is not None:
             Thread(target=exception_handler, args=[req, e]).start()
 
 
 async def __make_reqs(reqs: List[Request], size: int, timeout: Optional[int], include_content: bool, exception_handler,
-                      success_handler, verify_ssl: bool, proxies: Union[dict, str, None]) -> List[Response]:
+                      success_handler, verify_ssl: bool, proxies: Union[dict, str]) -> List[Response]:
     """
     Asynchronous runner for map() function. Do not start it yourself, use map() instead
 
@@ -269,38 +300,39 @@ async def __make_reqs(reqs: List[Request], size: int, timeout: Optional[int], in
     if verify_ssl:
         ssl = create_default_context()  # Create SSL Context
 
-    if proxies is not None:
-        if isinstance(proxies, dict):  # Dict format (requests-like): {'https': 'https/socks4(5)://...'}
-            proxies = list(proxies.values())[0]  # Get only the value string ("https/socks4(5)://...")
-        if isinstance(proxies, str):  # Check got string
-            if not __startswith(proxies, ['http', 'socks']):  # Doesnt start with supported type
-                proxies = None
-            else:
-                proxies = ProxyConnector.from_url(proxies)  # Create new proxy connector
-        elif not isinstance(proxies, TCPConnector):  # Not string and not TCPConnector (ProxyConnector return)
-            # - set proxy to None
-            proxies = None
+    if timeout is not None:  # Convert int timeout to ClientTimeout of aiohttp
+        timeout = ClientTimeout(total=timeout)
 
-    async with ClientSession(connector=proxies, timeout=ClientTimeout(total=timeout)) as sess:  # Create session
-        fut = asyncio.gather(  # Get responses
-            *[asyncio.ensure_future(
-                __exec_req(sem, sess, req, ssl, include_content, exception_handler, success_handler, verify_ssl)
-            ) for req in reqs]
-        )  # Create a task for each request
-        resp = await fut  # Asynchronously execute them
+    for req in reqs:  # Because every change of ClientTimeout has to happen in the same event loop, we do it here
+        if req.proxies is None:  # Request proxies not set
+            req.proxies = __create_connector(proxies)  # Set given proxies parameter of this function
+        else:
+            req.proxies = __create_connector(req.proxies)  # Proxies set as str/dict, convert to TCPConnector
+        if req.timeout is None:  # Timeout not set
+            if timeout is not None:
+                req.timeout = timeout
+        else:
+            req.timeout = ClientTimeout(total=req.timeout)  # Convert existing timeout number to ClientTimeout
+
+    fut = asyncio.gather(  # Get responses
+        *[asyncio.ensure_future(
+            __exec_req(sem, req, ssl, include_content, exception_handler, success_handler, verify_ssl)
+        ) for req in reqs]
+    )  # Create a task for each request
+    resp = await fut  # Asynchronously execute them
     return resp  # Return Response objects
 
 
-def map(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = None,
+def map(reqs: List[Request], size: Optional[int] = 10, default_timeout: Optional[int] = None,
         include_content: Optional[bool] = True, exception_handler=None, success_handler=None,
         verify_ssl: Optional[bool] = True, general_proxies: Union[str, dict] = None) -> List[Response]:
     """
     Map (start) asynchronous requests and get a list of responses
 
-    :param general_proxies: Proxies to use on all requests (TODO: Use only on ones that have own proxies not set)
+    :param general_proxies: Proxies to use on all requests where own proxies are not set
     :param reqs: List with Request objects. Use different methods to create them
     :param size: Connections per once. Might affect some website-security (nginx) against you
-    :param timeout: Connection timeout
+    :param default_timeout: Connection timeout to use on requests where their own is not set
     :param include_content: Whether include response content (+decoded Text) or not
     :param exception_handler: Function to report a failed (with exceptions) response (passes exception as parameter)
     :param success_handler: Function to report a succeeded (with no exceptions) response (passes Response object as
@@ -320,7 +352,7 @@ def map(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = 
     fut = asyncio.gather(
         asyncio.ensure_future(
             __make_reqs(
-                valid_reqs, size, timeout, include_content, exception_handler, success_handler, verify_ssl,
+                valid_reqs, size, default_timeout, include_content, exception_handler, success_handler, verify_ssl,
                 general_proxies
             )
         )
@@ -333,58 +365,35 @@ def map(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = 
     return resp[0]  # Format [[Response, Response...]], this is why we return resp[0] -> only the Responses
 
 
-def __threaded(executor: ThreadExecutor, reqs, size, timeout, include_content, exception_handler,
-               success_handler, verify_ssl, finished_handler, general_proxies) -> None:
+def __threaded(executor: ThreadExecutor, finished_handler, params) -> None:
     """
     Thread runner for mapThreaded(). Do not use yourself, use mapThreaded() instead
 
-    :param general_proxies: Proxies to use on all requests
+    :param params: Kwargs, but in dict
+    :param finished_handler: Callback for successful finish of ALL requests. Returns a list wit all responses
     :param executor: ThreadExecutor to report status and set data in
-    :param reqs: List with Request objects. Use different methods to create them
-    :param size: Connections per once. Might affect some website-security (nginx) against you
-    :param timeout: Connection timeout
-    :param include_content: Whether include response content (+decoded Text) or not
-    :param exception_handler: Function to report a failed (with exceptions) response (passes exception as parameter)
-    :param success_handler: Function to report a succeeded (with no exceptions) response (passes Response object as
-      parameter)
-    :param verify_ssl: Must SSLContext be generated to verify an SSL connection or not
-    :param finished_handler: Function to pass full Response objects list to
     """
     executor.start()  # Let the executor know who he deals with
 
     # Map requests in separate thread
-    resp = map(reqs, size, timeout, include_content, exception_handler, success_handler, verify_ssl, general_proxies)
+    resp = map(**params)
 
     if finished_handler is not None:
         Thread(target=finished_handler, args=[resp]).start()
     executor.set_data(resp)  # Set data for return and exit
 
 
-def map_threaded(reqs: List[Request], size: Optional[int] = 10, timeout: Optional[int] = None,
-                 include_content: Optional[bool] = True, exception_handler=None, success_handler=None,
-                 verify_ssl: Optional[bool] = True, finished_handler=None,
-                 general_proxies: Union[str, dict] = None) -> ThreadExecutor:
+def map_threaded(finished_handler=None, **kwargs) -> ThreadExecutor:
     """
-    Threaded execution of asynchronous requests. Returns a ThreadExecutor
+    Threaded execution of asynchronous requests. Returns a ThreadExecutor. FOR PARAMETERS SEE map()
 
-    :param general_proxies: Proxies to use on all requests
-    :param reqs: List with Request objects. Use different methods to create them
-    :param size: Connections per once. Might affect some website-security (nginx) against you
-    :param timeout: Connection timeout
-    :param include_content: Whether include response content (+decoded Text) or not
-    :param exception_handler: Function to report a failed (with exceptions) response (passes exception as parameter)
-    :param success_handler: Function to report a succeeded (with no exceptions) response (passes Response object as
-      parameter)
-    :param verify_ssl: Must SSLContext be generated to verify an SSL connection or not
-    :param finished_handler: Function to pass full Response objects list to
     :return: ThreadExecutor
     """
     executor = ThreadExecutor()
 
     Thread(
         target=__threaded,
-        args=[executor, reqs, size, timeout, include_content,
-              exception_handler, success_handler, verify_ssl, finished_handler, general_proxies]
+        args=(executor, finished_handler, kwargs)
     ).start()
 
     return executor
